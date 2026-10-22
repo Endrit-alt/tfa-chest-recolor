@@ -24,7 +24,7 @@ import net.runelite.client.ui.overlay.OverlayManager;
 
 @PluginDescriptor(
 	name = "TFA Chest Recolor",
-	internalName = "tfa-chest-glow",
+	internalName = "tfa-chest-recolor",
 	description = "Custom chest outlines, fading light rays and unique reward light recoloring in The Fractured Archive",
 	tags = {"tfa", "fractured", "archive", "the fractured archive", "fractured archive", "chest", "loot", "rewards",
 		"glow", "recolor", "color", "outline", "highlight", "beam", "light"}
