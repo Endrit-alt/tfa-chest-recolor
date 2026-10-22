@@ -1,3 +1,8 @@
+import com.sun.jdi.Bootstrap
+import com.sun.jdi.ObjectReference
+import com.sun.jdi.event.MethodEntryEvent
+import com.sun.jdi.request.EventRequest
+
 plugins {
 	id 'java'
 }
@@ -14,7 +19,7 @@ repositories {
 }
 
 def runeLiteVersion = 'latest.release'
-def pluginMainClass = 'com.example.ExamplePluginTest'
+def pluginMainClass = 'com.tfachestglow.TfaChestGlowLauncher'
 
 dependencies {
 	compileOnly group: 'net.runelite', name:'client', version: runeLiteVersion
@@ -27,7 +32,7 @@ dependencies {
 	testImplementation group: 'net.runelite', name:'jshell', version: runeLiteVersion
 }
 
-group = 'com.example'
+group = 'com.tfachestglow'
 
 tasks.withType(JavaCompile).configureEach {
 	options.encoding = 'UTF-8'
@@ -39,7 +44,93 @@ tasks.register('run', JavaExec) {
 	mainClass = pluginMainClass
 
 	jvmArgs "-ea"
+	// Development only: accept HotSwap connections from this computer.
+	jvmArgs "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:${providers.gradleProperty('hotSwapPort').getOrElse('5005')}"
 	args "--developer-mode", "--debug"
+}
+
+tasks.register('hotSwap') {
+	group = 'development'
+	description = 'Compile and apply plugin method-body edits to the running development client.'
+	dependsOn tasks.named('classes')
+
+	doLast {
+		def connector = Bootstrap.virtualMachineManager().attachingConnectors().find {
+			it.name() == 'com.sun.jdi.SocketAttach'
+		}
+		if (connector == null) {
+			throw new GradleException('HotSwap requires a full JDK with the jdk.jdi module.')
+		}
+		def connection = connector.defaultArguments()
+		connection.get('hostname').setValue('127.0.0.1')
+		connection.get('port').setValue(providers.gradleProperty('hotSwapPort').getOrElse('5005'))
+		connection.get('timeout').setValue('5000')
+		def vm
+		try {
+			vm = connector.attach(connection)
+		} catch (IOException e) {
+			throw new GradleException('Cannot connect to the development client. Launch it once with gradlew run, and close any other debugger using its port.', e)
+		}
+		try {
+			if (!vm.canRedefineClasses()) {
+				throw new GradleException('This client JVM does not support HotSwap.')
+			}
+			def definitions = [:]
+			sourceSets.main.output.classesDirs.each { root ->
+				fileTree(root).matching { include 'com/tfachestglow/**/*.class' }.each { compiled ->
+					def name = root.toPath().relativize(compiled.toPath()).toString()
+						.replace(File.separatorChar, '.' as char).replaceAll(/\.class$/, '')
+					vm.classesByName(name).each { type ->
+						definitions.put(type, compiled.bytes)
+					}
+				}
+			}
+			if (definitions.isEmpty()) {
+				throw new GradleException('TFA Chest Recolor is not loaded in this client. Enable it before applying edits.')
+			}
+			// One atomic replacement: an unsupported edit leaves the existing definitions intact.
+			vm.redefineClasses(definitions)
+			logger.lifecycle("Updated ${definitions.size()} plugin classes. Drawing changes appear on the next frame; existing settings and objects are preserved.")
+
+			// RuneLite retains configuration descriptors in its plugin list. A panel
+			// reopen alone does not rebuild annotation metadata after HotSwap.
+			def panelType = vm.classesByName('net.runelite.client.plugins.config.PluginListPanel').find { it.isPrepared() }
+			def panel = vm.canGetInstanceInfo() && panelType != null ? panelType.instances(1).find() : null
+			if (panel != null) {
+				def request = vm.eventRequestManager().createMethodEntryRequest()
+				request.addClassFilter('net.runelite.client.callback.Hooks')
+				request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD)
+				def eventSet
+				try {
+					request.enable()
+					eventSet = vm.eventQueue().remove(5000)
+					request.disable()
+					def entry = eventSet == null ? null : eventSet.find { it instanceof MethodEntryEvent }
+					if (entry != null) {
+						// This callback ignores its event parameter and queues a rebuild
+						// on Swing's event thread. Debugger tooling only; no reflection or
+						// changes to RuneLite core classes are included in the plugin.
+						def refresh = panelType.methodsByName('onExternalPluginsChanged', '(Lnet/runelite/client/events/ExternalPluginsChanged;)V').first()
+						panel.invokeMethod(entry.thread(), refresh, [null], ObjectReference.INVOKE_SINGLE_THREADED)
+						logger.lifecycle('Queued RuneLite settings metadata refresh. Reopen the plugin settings to use updated ranges and labels.')
+					} else {
+						logger.warn('Code updated, but no client callback arrived for the settings refresh.')
+					}
+				} finally {
+					vm.eventRequestManager().deleteEventRequest(request)
+					if (eventSet != null) {
+						eventSet.resume()
+					}
+				}
+			} else {
+				logger.lifecycle('Settings panel has not been created; it will read current metadata when first opened.')
+			}
+		} catch (UnsupportedOperationException e) {
+			throw new GradleException('This edit changes the class structure. Java 11 HotSwap supports method bodies only; restart the development client for added/removed fields, methods, or classes.', e)
+		} finally {
+			vm.dispose()
+		}
+	}
 }
 
 tasks.register('shadowJar', Jar) {
